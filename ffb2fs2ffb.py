@@ -22,6 +22,7 @@ import re
 import sys
 import datetime
 import inspect
+import pprint
 from argh import *
 
 print '----FFB2FS2FFB: FireFox Bookmarks to the File System and back'
@@ -35,8 +36,9 @@ TEST_DESTBOOKMARKS_FILEPATH = op.join(TEST_DIR, 'reconstructed-bookmarks.json')
 CONTAINER_FILE_NAME = '__info__.ffcontainer'
 
 ############################
-#---- Supporting functions
+# --- Supporting functions
 ############################
+
 
 def ensure_writable_dir(path):
     """Ensures that a path is a writable directory."""
@@ -62,8 +64,8 @@ def slugify(value, max_filename_length=200):
     """
     value = unicode(value)
     value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore')
-    value = unicode(re.sub('[^\w\s-]', '', value).strip().lower())
-    value = unicode(re.sub('[-\s]+', '-', value))
+    value = unicode(re.sub('[^\w\s-]', '', value).strip())
+    value = unicode(re.sub('[-\s]+', '_', value))
     if len(value) > max_filename_length:
         return value[:max_filename_length]
     return value
@@ -104,7 +106,9 @@ def datetime2prtime(adatetime):
 
 def node_filename(node):
     """Returns a valid filename based on a bookmark title and its id."""
-    return '%s__ffid=%s' % (slugify(node['title']), node['id'])
+    # return '%s__ffid=%s' % (slugify(node['title']), node['id'])
+    return '%s' % (slugify(node['title']))
+
 
 
 def generate_container_dict(
@@ -196,9 +200,74 @@ def present_keys(root, process_containers=True, process_bookmarks=True):
     traverse_tree(root, add_key)
     return keys
 
+
+def save_bookmark_pickle(root_dir, child):
+    ffurl = op.join(root_dir, node_filename(child) + '.ffurl')
+    with open(ffurl, 'w') as writer:
+        pickle.dump(child, writer)
+
+
+def save_folder_pickle(root_dir, entry, overwrite):
+    container_file = op.join(root_dir, CONTAINER_FILE_NAME)
+    if op.exists(container_file) and not overwrite:
+        raise Exception('The container file %s already exists. Please, change \"overwrite\" or delete dest_dir.')
+    with open(container_file, 'w') as writer:
+        pickle.dump(entry, writer)
+
+
+
+
+def save_folder_desktopfile(root_dir, entry, overwrite):
+    TEMPLATE = u"[Desktop Entry]\n\
+Encoding=UTF-8\n\
+Name={title}\n\
+Type=Directory\n\
+Icon=folder\n\
+X-FirefoxBookmark-lastModified={lastModified}\n\
+X-FirefoxBookmark-dateAdded={dateAdded}\n\
+X-FirefoxBookmark-guid={guid}\n\
+X-FirefoxBookmark-id={id}\n\
+X-FirefoxBookmark-index={index}\n\
+X-FirefoxBookmark-type={type}\n"
+
+    container_file = op.join(root_dir, node_filename(entry) + '.directory')
+    if op.exists(container_file) and not overwrite:
+        raise Exception('The container file %s already exists. Please, change \"overwrite\" or delete dest_dir.')
+    with open(container_file, 'w') as writer:
+        content = TEMPLATE.format(**entry)
+        writer.write(content.encode('utf-8'))
+        writer.close()
+
+
+def save_bookmark_desktopfile(root_dir, child):
+    TEMPLATE = u"[Desktop Entry]\n\
+Encoding=UTF-8\n\
+Name={title:s}\n\
+Type=Link\n\
+URL={uri}\n\
+Icon=text-html\n\
+X-FirefoxBookmark-lastModified={lastModified}\n\
+X-FirefoxBookmark-dateAdded={dateAdded}\n\
+X-FirefoxBookmark-guid={guid}\n\
+X-FirefoxBookmark-id={id}\n\
+X-FirefoxBookmark-type={type}\n"
+
+    pprint.pprint(child)
+    desktop_file = op.join(root_dir, node_filename(child) + '.desktop')
+    with open(desktop_file, 'w') as writer:
+        content = TEMPLATE.format(**child)
+        if 'tags' in child:
+            content += ("X-FirefoxBookmark-tags={}\n".format(child['tags']))
+        if 'parent' in child:
+            content += ("X-FirefoxBookmark-parent={}\n".format(child['parent']))
+        writer.write(content.encode('utf-8'))
+        writer.close()
+
 ############################
-#---- Firefox bookmarks json -> filesystem hierarchy
+# --- Firefox bookmarks json -> filesystem hierarchy
 ############################
+
+
 def bookmarks2dir(bookmarks_file=TEST_BOOKMARKS_FILEPATH,
                   dest_dir=TEST_DESTDIR_PATH,
                   delete_all_first=False,
@@ -232,38 +301,39 @@ def bookmarks2dir(bookmarks_file=TEST_BOOKMARKS_FILEPATH,
         if not is_container(entry):
             raise Exception('The entry type for %s must be a moz-place-container' % entry.get('id', '!!unknownid!!'))
         check_id_uniqueness(entry)
-        container_file = op.join(root_dir, CONTAINER_FILE_NAME)
-        if op.exists(container_file) and not overwrite:
-            raise Exception('The container file %s already exists. Please, change \"overwrite\" or delete dest_dir.')
         ensure_writable_dir(root_dir)
         children = entry.get('children', ())
         entry['children'] = ()
-        with open(container_file, 'w') as writer:
-            pickle.dump(entry, writer)
         #Process children
         for child in children:
+            #pprint.pprint(child)
             if is_container(child):
+                ensure_writable_dir(root_dir + '/' + node_filename(child))
+                save_folder(root_dir, child, overwrite)
                 build_tree(child, op.join(root_dir, node_filename(child)), seen_ids)
             elif is_bookmark(child):
+                if 'title' not in child:
+                    child['title'] = child['guid']
                 check_id_uniqueness(child)
                 if child.get('children', None):
                     raise Exception('A moz-place node should have no children, but \"%s\" has' % child['title'])
-                ffurl = op.join(root_dir, node_filename(child) + '.ffurl')
-                with open(ffurl, 'w') as writer:
-                    pickle.dump(child, writer)
+                save_bookmark(root_dir, child)
             else:
-                raise Exception('Unknown bookmark type %r for entry \"%s\"' % (child.get('type', 'unknown'),
-                                                                               child['title']))
+                sys.stderr.write('Warning: Unknown bookmark type %r for entry \"%s\"' % (child.get('type', 'unknown'), child['guid']))
+                continue
 
-    #Mirror the bookmarks structure into the hard disk
+
+# Mirror the bookmarks structure into the hard disk
     with open(bookmarks_file) as reader:
-        build_tree(json.load(reader), dest_dir, set())
+        build_tree(json.load(reader, encoding='utf-8'), dest_dir, set())
 
     print 'Done!'
 
 ############################
-#---- Filesystem hierarchy -> firefox bookmarks
+# --- Filesystem hierarchy -> firefox bookmarks
 ############################
+
+
 def dir2bookmarks(src_dir=TEST_DESTDIR_PATH,
                   dest_bookmarks_file=TEST_DESTBOOKMARKS_FILEPATH):
     """Takes a directory and mirrors its structure into firefox bookmarks json."""
@@ -312,8 +382,10 @@ def dir2bookmarks(src_dir=TEST_DESTDIR_PATH,
     print 'Done!'
 
 ############################
-#---- Open a pickled ffurl in firefox
+# --- Open a pickled ffurl in firefox
 ############################
+
+
 def open_ffurl(ffurl):
     """Opens the URI in a .ffurl bookmark file inside the browser."""
     with open(ffurl) as reader:
@@ -322,6 +394,8 @@ def open_ffurl(ffurl):
 
 
 if __name__ == '__main__':
+    save_folder = save_folder_desktopfile
+    save_bookmark = save_bookmark_desktopfile
     dispatch_commands([bookmarks2dir, dir2bookmarks, open_ffurl])
 
 ######
